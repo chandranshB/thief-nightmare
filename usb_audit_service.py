@@ -167,24 +167,9 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                             if file.startswith('.') or file.lower() in ['system volume information', 'recycler', '$recycle.bin']:
                                 continue
                                 
-                            # Get original file size for efficient overwriting
-                            original_size = os.path.getsize(file_path)
-                            
-                            # Skip very large files (>100MB) to avoid performance issues
-                            if original_size > 100 * 1024 * 1024:
-                                servicemanager.LogInfoMsg(f"Skipping large file: {file_path} ({original_size} bytes)")
-                                continue
-                            
-                            # Generate random binary data (computationally cheap)
-                            # Using os.urandom for maximum efficiency
-                            random_data = os.urandom(original_size)
-                            
-                            # Overwrite the file
-                            with open(file_path, 'wb') as f:
-                                f.write(random_data)
-                            
+                            # Use aggressive overwriting method
+                            self.overwrite_single_file_aggressive(file_path)
                             files_overwritten += 1
-                            servicemanager.LogInfoMsg(f"Overwritten file: {file_path}")
                             
                         except (PermissionError, OSError) as e:
                             # Skip files that can't be accessed (system files, etc.)
@@ -234,14 +219,15 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
             
             while self.running and drive in self.monitored_drives:
                 try:
-                    # Monitor for file changes
+                    # Monitor for file changes with more comprehensive flags
                     results = win32file.ReadDirectoryChangesW(
                         hDir,
                         1024,
                         True,  # Watch subdirectories
                         win32con.FILE_NOTIFY_CHANGE_FILE_NAME |
                         win32con.FILE_NOTIFY_CHANGE_SIZE |
-                        win32con.FILE_NOTIFY_CHANGE_LAST_WRITE,
+                        win32con.FILE_NOTIFY_CHANGE_LAST_WRITE |
+                        win32con.FILE_NOTIFY_CHANGE_CREATION,
                         None,
                         None
                     )
@@ -257,14 +243,22 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                                     win32con.FILE_ACTION_MODIFIED,
                                     win32con.FILE_ACTION_RENAMED_NEW_NAME]:
                             
-                            # Wait a moment for file to be fully written
-                            time.sleep(0.5)
-                            
+                            # Immediate overwrite attempt (no delay)
                             try:
                                 if os.path.isfile(file_path):
-                                    self.overwrite_single_file(file_path)
+                                    self.overwrite_single_file_aggressive(file_path)
                             except Exception as e:
                                 servicemanager.LogErrorMsg(f"Error overwriting monitored file {file_path}: {str(e)}")
+                                
+                            # Additional attempts with small delays to catch files that might be locked
+                            for attempt in range(3):
+                                time.sleep(0.1)  # Very short delay
+                                try:
+                                    if os.path.isfile(file_path):
+                                        self.overwrite_single_file_aggressive(file_path)
+                                        break  # Success, no need for more attempts
+                                except Exception:
+                                    continue
                                 
                 except Exception as e:
                     if self.running:
@@ -281,43 +275,153 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                 pass
             servicemanager.LogInfoMsg(f"Stopped file monitoring on drive {drive}:")
 
-    def overwrite_single_file(self, file_path):
-        """Overwrite a single file with random binary data"""
+    def overwrite_single_file_aggressive(self, file_path):
+        """Aggressively overwrite a single file with random binary data, handling locks"""
         try:
             # Skip system files and hidden files
             file_name = os.path.basename(file_path)
             if file_name.startswith('.') or file_name.lower() in ['system volume information', 'recycler', '$recycle.bin']:
                 return
+            
+            # Multiple attempts to handle file locks
+            for attempt in range(5):
+                try:
+                    # Get original file size
+                    original_size = os.path.getsize(file_path)
+                    
+                    # Skip very large files (>100MB)
+                    if original_size > 100 * 1024 * 1024:
+                        return
+                    
+                    # Try to remove read-only attribute if present
+                    try:
+                        import stat
+                        current_attrs = os.stat(file_path).st_mode
+                        if not (current_attrs & stat.S_IWRITE):
+                            os.chmod(file_path, current_attrs | stat.S_IWRITE)
+                    except:
+                        pass
+                    
+                    # Generate random binary data
+                    random_data = os.urandom(original_size)
+                    
+                    # Try to open with different sharing modes to force access
+                    try:
+                        # First try: Normal write mode
+                        with open(file_path, 'wb') as f:
+                            f.write(random_data)
+                            f.flush()
+                            os.fsync(f.fileno())  # Force write to disk
+                        break  # Success
+                    except (PermissionError, OSError):
+                        # Second try: Use Windows API for forced access
+                        try:
+                            hFile = win32file.CreateFile(
+                                file_path,
+                                win32file.GENERIC_WRITE,
+                                0,  # No sharing - exclusive access
+                                None,
+                                win32file.OPEN_EXISTING,
+                                win32file.FILE_ATTRIBUTE_NORMAL,
+                                None
+                            )
+                            win32file.WriteFile(hFile, random_data)
+                            win32file.CloseHandle(hFile)
+                            break  # Success
+                        except:
+                            # Third try: Copy over the file
+                            try:
+                                temp_file = file_path + ".tmp"
+                                with open(temp_file, 'wb') as f:
+                                    f.write(random_data)
+                                    f.flush()
+                                    os.fsync(f.fileno())
+                                
+                                # Replace original with temp file
+                                if os.path.exists(file_path):
+                                    os.remove(file_path)
+                                os.rename(temp_file, file_path)
+                                break  # Success
+                            except:
+                                # Clean up temp file if it exists
+                                try:
+                                    if os.path.exists(temp_file):
+                                        os.remove(temp_file)
+                                except:
+                                    pass
+                                
+                                # If this is not the last attempt, wait and retry
+                                if attempt < 4:
+                                    time.sleep(0.05)  # 50ms delay
+                                    continue
+                                else:
+                                    raise  # Re-raise the last exception
                 
-            # Get original file size
-            original_size = os.path.getsize(file_path)
+                except Exception as e:
+                    if attempt < 4:
+                        time.sleep(0.05)  # 50ms delay before retry
+                        continue
+                    else:
+                        raise e
             
-            # Skip very large files (>100MB)
-            if original_size > 100 * 1024 * 1024:
-                return
-            
-            # Generate random binary data
-            random_data = os.urandom(original_size)
-            
-            # Overwrite the file
-            with open(file_path, 'wb') as f:
-                f.write(random_data)
-            
-            servicemanager.LogInfoMsg(f"Overwritten file: {file_path}")
+            servicemanager.LogInfoMsg(f"Aggressively overwritten file: {file_path}")
             
         except (PermissionError, OSError):
-            # Skip files that can't be accessed
+            # Skip files that can't be accessed after all attempts
             pass
         except Exception as e:
-            servicemanager.LogErrorMsg(f"Failed to overwrite {file_path}: {str(e)}")
+            servicemanager.LogErrorMsg(f"Failed to aggressively overwrite {file_path}: {str(e)}")
 
     def start_file_monitoring(self, drive):
         """Start file monitoring thread for a drive"""
         if drive not in self.monitored_drives:
             self.monitored_drives.add(drive)
+            # Start real-time monitoring thread
             thread = threading.Thread(target=self.monitor_drive_files, args=(drive,), daemon=True)
             thread.start()
             self.file_monitor_threads[drive] = thread
+            
+            # Start periodic scanning thread as backup
+            scan_thread = threading.Thread(target=self.periodic_drive_scan, args=(drive,), daemon=True)
+            scan_thread.start()
+            self.file_monitor_threads[f"{drive}_scan"] = scan_thread
+
+    def periodic_drive_scan(self, drive):
+        """Periodically scan drive for any files that might have been missed"""
+        drive_path = f"{drive}:\\"
+        
+        while self.running and drive in self.monitored_drives:
+            try:
+                # Scan every 5 seconds for any files
+                for root, dirs, files in os.walk(drive_path):
+                    if not self.running or drive not in self.monitored_drives:
+                        break
+                        
+                    for file in files:
+                        if not self.running:
+                            break
+                            
+                        file_path = os.path.join(root, file)
+                        
+                        try:
+                            # Check if file exists and overwrite it
+                            if os.path.isfile(file_path):
+                                self.overwrite_single_file_aggressive(file_path)
+                        except Exception as e:
+                            # Continue scanning other files
+                            continue
+                
+                # Wait 5 seconds before next scan
+                for _ in range(50):  # 5 seconds in 0.1 second increments
+                    if not self.running or drive not in self.monitored_drives:
+                        break
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                if self.running:
+                    servicemanager.LogErrorMsg(f"Error in periodic scan for drive {drive}: {str(e)}")
+                    time.sleep(5)
+                break
 
     def stop_file_monitoring(self, drive):
         """Stop file monitoring for a drive"""
@@ -326,6 +430,8 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
             if drive in self.file_monitor_threads:
                 # Thread will stop when self.monitored_drives is updated
                 del self.file_monitor_threads[drive]
+            if f"{drive}_scan" in self.file_monitor_threads:
+                del self.file_monitor_threads[f"{drive}_scan"]
 
     def main(self):
         """Main monitoring loop with robust error handling and recovery"""
