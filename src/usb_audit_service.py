@@ -640,7 +640,7 @@ class USBDriveFileOverwriter(win32serviceutil.ServiceFramework):
                     
             except Exception as e:
                 self.consecutive_errors += 1
-                error_msg = f"Error in monitoring loop (error #{self.consecutive_errors}): {str(e)}"
+                error_msg = f"Error in monitoring loop (error {self.consecutive_errors}/{self.max_consecutive_errors}): {str(e)}"
                 servicemanager.LogErrorMsg(error_msg)
                 servicemanager.LogErrorMsg(traceback.format_exc())
                 
