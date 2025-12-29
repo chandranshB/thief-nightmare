@@ -93,8 +93,9 @@ del "%USERPROFILE%\Desktop\USB Security Controller.lnk"
 
 ### Credits
 
-**Developed by Chandresh** - Advanced USB Security Solution  
+**Developed by Chandransh** - Advanced USB Security Solution  
 *Stealth protection for modern security needs*
 
 </details>
+
 
