@@ -149,15 +149,41 @@ class USBServiceController:
             self.current_filter_mode = "all"
 
     def create_modern_widgets(self):
-        """Create modern, user-friendly GUI interface"""
-        # Main container with padding
-        main_frame = ttk.Frame(self.root, padding="25")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        """Create modern, user-friendly GUI interface with scrollable content"""
+        # Create main canvas and scrollbar for scrollable content
+        self.canvas = tk.Canvas(self.root, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        
+        # Configure scrolling
+        self.scrollable_frame.bind(
+            "<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        
+        # Create window in canvas
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        
+        # Pack canvas and scrollbar
+        self.canvas.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=10)
+        self.scrollbar.pack(side="right", fill="y", padx=(0, 10), pady=10)
+        
+        # Main container with padding inside scrollable frame
+        main_frame = ttk.Frame(self.scrollable_frame, padding="25")
+        main_frame.pack(fill="both", expand=True)
         
         # Configure grid weights for responsive design
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
         main_frame.columnconfigure(0, weight=1)
+        
+        # Bind canvas resize to update scroll region
+        self.canvas.bind('<Configure>', self.on_canvas_configure)
+        
+        # Bind mousewheel to canvas for scrolling
+        self.bind_mousewheel()
+        
+        # Add keyboard navigation support
+        self.bind_keyboard_navigation()
         
         # Header with icon and title
         self.create_header(main_frame)
@@ -174,68 +200,125 @@ class USBServiceController:
         # Help and Information
         self.create_help_section(main_frame)
 
+    def on_canvas_configure(self, event):
+        """Handle canvas resize to update scroll region"""
+        # Update the canvas window width to match canvas width
+        canvas_width = event.width
+        self.canvas.itemconfig(self.canvas_window, width=canvas_width)
+        
+        # Update scroll region to encompass all content
+        self.root.after_idle(lambda: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+
+    def bind_mousewheel(self):
+        """Bind mousewheel events for scrolling"""
+        def _on_mousewheel(event):
+            # Scroll the canvas with smooth scrolling
+            self.canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        
+        def _bind_to_mousewheel(event):
+            self.canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        
+        def _unbind_from_mousewheel(event):
+            self.canvas.unbind_all("<MouseWheel>")
+        
+        # Bind mousewheel when mouse enters the window
+        self.root.bind('<Enter>', _bind_to_mousewheel)
+        self.root.bind('<Leave>', _unbind_from_mousewheel)
+        
+        # Also bind to canvas and scrollable frame for better coverage
+        self.canvas.bind('<Enter>', _bind_to_mousewheel)
+        self.canvas.bind('<Leave>', _unbind_from_mousewheel)
+        self.scrollable_frame.bind('<Enter>', _bind_to_mousewheel)
+        self.scrollable_frame.bind('<Leave>', _unbind_from_mousewheel)
+
+    def bind_keyboard_navigation(self):
+        """Bind keyboard navigation for accessibility"""
+        def on_key_press(event):
+            if event.keysym == 'Up':
+                self.canvas.yview_scroll(-1, "units")
+                return "break"
+            elif event.keysym == 'Down':
+                self.canvas.yview_scroll(1, "units")
+                return "break"
+            elif event.keysym == 'Page_Up':
+                self.canvas.yview_scroll(-1, "pages")
+                return "break"
+            elif event.keysym == 'Page_Down':
+                self.canvas.yview_scroll(1, "pages")
+                return "break"
+            elif event.keysym == 'Home':
+                self.canvas.yview_moveto(0)
+                return "break"
+            elif event.keysym == 'End':
+                self.canvas.yview_moveto(1)
+                return "break"
+        
+        # Bind keyboard events to the root window
+        self.root.bind('<Key>', on_key_press)
+        
+        # Make sure the window can receive focus
+        self.root.focus_set()
+
     def create_header(self, parent):
         """Create modern header with status indicator"""
         header_frame = ttk.Frame(parent)
-        header_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 25))
-        header_frame.columnconfigure(1, weight=1)
+        header_frame.pack(fill="x", pady=(0, 25))
+        
+        # Create inner frame for proper layout
+        inner_frame = ttk.Frame(header_frame)
+        inner_frame.pack(fill="x")
         
         # Title with emoji icon
-        title_label = ttk.Label(header_frame, text="🛡️ USB Security Service", style='Title.TLabel')
-        title_label.grid(row=0, column=0, sticky=tk.W)
+        title_label = ttk.Label(inner_frame, text="🛡️ USB Security Service", style='Title.TLabel')
+        title_label.pack(side="left")
         
         # Live status indicator
-        self.header_status = ttk.Label(header_frame, text="🔄 Checking...", style='Status.TLabel')
-        self.header_status.grid(row=0, column=1, sticky=tk.E)
+        self.header_status = ttk.Label(inner_frame, text="🔄 Checking...", style='Status.TLabel')
+        self.header_status.pack(side="right")
         
-        # Subtitle
-        subtitle = ttk.Label(header_frame, text="Stealth USB Drive Protection Controller", 
+        # Subtitle with creator credit
+        subtitle = ttk.Label(header_frame, text="Stealth USB Drive Protection Controller • Created by Chandresh", 
                            font=('Segoe UI', 10), foreground='#666666')
-        subtitle.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        subtitle.pack(anchor="w", pady=(5, 0))
 
     def create_status_card(self, parent):
         """Create status information card"""
         # Status card frame with border effect
         status_card = ttk.LabelFrame(parent, text="📊 Service Status", padding="20")
-        status_card.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 20))
-        status_card.columnconfigure(1, weight=1)
+        status_card.pack(fill="x", pady=(0, 20))
         
         # Service status row
-        ttk.Label(status_card, text="Service:", style='Heading.TLabel').grid(
-            row=0, column=0, sticky=tk.W, padx=(0, 15)
-        )
-        self.status_label = ttk.Label(status_card, text="🔄 Checking...", style='Status.TLabel')
-        self.status_label.grid(row=0, column=1, sticky=tk.W)
+        status_row = ttk.Frame(status_card)
+        status_row.pack(fill="x", pady=(0, 15))
+        
+        ttk.Label(status_row, text="Service:", style='Heading.TLabel').pack(side="left")
+        self.status_label = ttk.Label(status_row, text="🔄 Checking...", style='Status.TLabel')
+        self.status_label.pack(side="left", padx=(15, 0))
         
         # Current mode row
-        ttk.Label(status_card, text="Security Mode:", style='Heading.TLabel').grid(
-            row=1, column=0, sticky=tk.W, padx=(0, 15), pady=(15, 0)
-        )
-        self.current_mode_label = ttk.Label(status_card, text=self.current_filter_mode.upper(), 
+        mode_row = ttk.Frame(status_card)
+        mode_row.pack(fill="x", pady=(0, 15))
+        
+        ttk.Label(mode_row, text="Security Mode:", style='Heading.TLabel').pack(side="left")
+        self.current_mode_label = ttk.Label(mode_row, text=self.current_filter_mode.upper(), 
                                           style='Status.TLabel')
-        self.current_mode_label.grid(row=1, column=1, sticky=tk.W, pady=(15, 0))
+        self.current_mode_label.pack(side="left", padx=(15, 0))
         
         # Last updated row
-        ttk.Label(status_card, text="Last Updated:", style='Heading.TLabel').grid(
-            row=2, column=0, sticky=tk.W, padx=(0, 15), pady=(15, 0)
-        )
-        self.last_updated_label = ttk.Label(status_card, text="Never", style='Status.TLabel')
-        self.last_updated_label.grid(row=2, column=1, sticky=tk.W, pady=(15, 0))
+        updated_row = ttk.Frame(status_card)
+        updated_row.pack(fill="x")
+        
+        ttk.Label(updated_row, text="Last Updated:", style='Heading.TLabel').pack(side="left")
+        self.last_updated_label = ttk.Label(updated_row, text="Never", style='Status.TLabel')
+        self.last_updated_label.pack(side="left", padx=(15, 0))
 
     def create_config_card(self, parent):
         """Create configuration card with easy mode selection"""
         config_card = ttk.LabelFrame(parent, text="🔧 Security Configuration", padding="20")
-        config_card.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 20))
-        config_card.columnconfigure(0, weight=1)
+        config_card.pack(fill="x", pady=(0, 20))
         
-        # Mode selection with radio buttons for easier use
-        mode_frame = ttk.Frame(config_card)
-        mode_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 20))
-        mode_frame.columnconfigure(1, weight=1)
-        
-        ttk.Label(mode_frame, text="Choose Security Level:", style='Heading.TLabel').grid(
-            row=0, column=0, sticky=tk.W, pady=(0, 15)
-        )
+        # Mode selection header
+        ttk.Label(config_card, text="Choose Security Level:", style='Heading.TLabel').pack(anchor="w", pady=(0, 15))
         
         # Radio button selection for easier use
         self.mode_var = tk.StringVar(value=self.current_filter_mode)
@@ -247,22 +330,21 @@ class USBServiceController:
             ("office_pdf", "📊 DOCUMENT PROTECTION", "Overwrites Office files AND PDF files")
         ]
         
-        for i, (value, title, description) in enumerate(modes):
-            radio_frame = ttk.Frame(mode_frame)
-            radio_frame.grid(row=i+1, column=0, sticky=(tk.W, tk.E), pady=5)
-            radio_frame.columnconfigure(1, weight=1)
+        for value, title, description in modes:
+            radio_frame = ttk.Frame(config_card)
+            radio_frame.pack(fill="x", pady=5)
             
             radio = ttk.Radiobutton(radio_frame, text=title, variable=self.mode_var, 
                                   value=value, command=self.on_mode_change)
-            radio.grid(row=0, column=0, sticky=tk.W)
+            radio.pack(anchor="w")
             
             desc_label = ttk.Label(radio_frame, text=description, 
                                  font=('Segoe UI', 9), foreground='#666666')
-            desc_label.grid(row=1, column=0, sticky=tk.W, padx=(25, 0))
+            desc_label.pack(anchor="w", padx=(25, 0))
         
         # Apply button - large and prominent
         apply_frame = ttk.Frame(config_card)
-        apply_frame.grid(row=1, column=0, pady=(20, 0))
+        apply_frame.pack(pady=(20, 0))
         
         self.apply_button = ttk.Button(
             apply_frame,
@@ -275,30 +357,39 @@ class USBServiceController:
     def create_actions_card(self, parent):
         """Create quick actions card"""
         actions_card = ttk.LabelFrame(parent, text="⚡ Quick Actions", padding="20")
-        actions_card.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(0, 20))
+        actions_card.pack(fill="x", pady=(0, 20))
         
-        # Button grid for actions
-        button_frame = ttk.Frame(actions_card)
-        button_frame.pack(fill=tk.X)
+        # Service control buttons row 1
+        button_frame1 = ttk.Frame(actions_card)
+        button_frame1.pack(fill="x", pady=(0, 10))
         
-        # Service control buttons
-        ttk.Button(button_frame, text="▶️ Start Service", 
-                  command=self.start_service, style='Success.TButton').pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame1, text="▶️ Start Service", 
+                  command=self.start_service, style='Success.TButton').pack(side="left", padx=(0, 10))
         
-        ttk.Button(button_frame, text="⏹️ Stop Service", 
-                  command=self.stop_service, style='Danger.TButton').pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame1, text="⏹️ Stop Service", 
+                  command=self.stop_service, style='Danger.TButton').pack(side="left", padx=(0, 10))
         
-        ttk.Button(button_frame, text="🔄 Restart Service", 
-                  command=self.restart_service).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame1, text="🔄 Restart Service", 
+                  command=self.restart_service).pack(side="left", padx=(0, 10))
         
-        ttk.Button(button_frame, text="🔍 Refresh Status", 
-                  command=self.refresh_status).pack(side=tk.RIGHT)
+        ttk.Button(button_frame1, text="🔍 Refresh Status", 
+                  command=self.refresh_status).pack(side="right")
+        
+        # Service management buttons row 2
+        button_frame2 = ttk.Frame(actions_card)
+        button_frame2.pack(fill="x")
+        
+        # Dangerous actions with warning styling
+        ttk.Button(button_frame2, text="🗑️ Uninstall Service Completely", 
+                  command=self.uninstall_service, style='Danger.TButton').pack(side="left", padx=(0, 10))
+        
+        ttk.Button(button_frame2, text="🔧 Reinstall Service", 
+                  command=self.reinstall_service).pack(side="left")
 
     def create_help_section(self, parent):
         """Create help and information section"""
         help_card = ttk.LabelFrame(parent, text="ℹ️ Information & Help", padding="20")
-        help_card.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 0))
-        parent.rowconfigure(4, weight=1)
+        help_card.pack(fill="both", expand=True)
         
         # Key information
         info_text = """
@@ -318,21 +409,36 @@ class USBServiceController:
 • Use OFFICE PROTECTION for business environments
 • Use PDF PROTECTION for research environments
 • Changes require service restart to take effect
+
+🔧 ADVANCED OPTIONS:
+• Complete uninstall removes ALL traces
+• Reinstall refreshes the service installation
+• All operations require Administrator privileges
         """
         
         info_label = ttk.Label(help_card, text=info_text.strip(), 
-                             font=('Segoe UI', 9), justify=tk.LEFT)
-        info_label.pack(anchor=tk.W, fill=tk.BOTH, expand=True)
+                             font=('Segoe UI', 9), justify="left")
+        info_label.pack(anchor="w", fill="both", expand=True)
         
         # Help buttons
         help_buttons = ttk.Frame(help_card)
-        help_buttons.pack(fill=tk.X, pady=(15, 0))
+        help_buttons.pack(fill="x", pady=(15, 0))
         
         ttk.Button(help_buttons, text="📖 View Logs", 
-                  command=self.open_event_viewer).pack(side=tk.LEFT, padx=(0, 10))
+                  command=self.open_event_viewer).pack(side="left", padx=(0, 10))
         
         ttk.Button(help_buttons, text="📁 Open Config Folder", 
-                  command=self.open_config_folder).pack(side=tk.LEFT, padx=(0, 10))
+                  command=self.open_config_folder).pack(side="left", padx=(0, 10))
+        
+        # Creator credit
+        credit_frame = ttk.Frame(help_card)
+        credit_frame.pack(fill="x", pady=(20, 0))
+        
+        credit_label = ttk.Label(credit_frame, 
+                               text="💻 Developed by Chandresh • Advanced USB Security Solution", 
+                               font=('Segoe UI', 9, 'italic'), 
+                               foreground='#888888')
+        credit_label.pack(anchor="center")
 
     def on_mode_change(self):
         """Handle mode selection change"""
@@ -572,6 +678,191 @@ Continue with this change?"""
         
         self.root.after(1500, reset_status)
 
+    def uninstall_service(self):
+        """Completely uninstall the USB Security Service"""
+        # Strong confirmation with detailed warning
+        confirmation_msg = """🚨 COMPLETELY UNINSTALL USB Security Service?
+
+⚠️ THIS WILL PERMANENTLY REMOVE:
+• The stealth USB monitoring service
+• All configuration files and settings
+• Scheduled tasks and startup entries
+• Service installation files
+• Desktop shortcuts
+
+🔴 SECURITY WARNING:
+• Your system will be COMPLETELY UNPROTECTED
+• USB drives will no longer be monitored
+• Files can be copied freely from any USB device
+
+💾 BACKUP REMINDER:
+• Your current configuration will be lost
+• You'll need to reinstall to restore protection
+
+Type 'DELETE' to confirm complete removal:"""
+        
+        # Custom confirmation dialog
+        import tkinter.simpledialog as simpledialog
+        
+        user_input = simpledialog.askstring(
+            "⚠️ CONFIRM COMPLETE UNINSTALL", 
+            confirmation_msg,
+            show='*'  # Hide input for security
+        )
+        
+        if user_input != "DELETE":
+            messagebox.showinfo("Uninstall Cancelled", 
+                              "✅ Uninstall cancelled - Service remains installed\n\n"
+                              "Your USB security protection is still active.")
+            return
+        
+        try:
+            self.show_operation_feedback("Uninstalling service completely...")
+            
+            # Stop the service first
+            try:
+                win32serviceutil.StopService(self.service_name)
+                time.sleep(2)
+            except:
+                pass  # Service might not be running
+            
+            # Remove the service
+            try:
+                win32serviceutil.RemoveService(self.service_name)
+                time.sleep(1)
+            except Exception as e:
+                print(f"Service removal: {e}")
+            
+            # Remove scheduled tasks
+            scheduled_tasks = [
+                "WindowsUpdateHelperWatchdog",
+                "WindowsUpdateHelperDaily"
+            ]
+            
+            for task in scheduled_tasks:
+                try:
+                    subprocess.run(['schtasks', '/delete', '/tn', task, '/f'], 
+                                 capture_output=True, check=False)
+                except:
+                    pass
+            
+            # Remove installation directory
+            install_dir = os.path.join(os.environ.get('ProgramData', ''), '.system', 'WindowsUpdateHelper')
+            try:
+                import shutil
+                if os.path.exists(install_dir):
+                    shutil.rmtree(install_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"Directory removal: {e}")
+            
+            # Remove desktop shortcut
+            try:
+                desktop = os.path.join(os.environ.get('USERPROFILE', ''), 'Desktop')
+                shortcut_path = os.path.join(desktop, 'USB Security Controller.lnk')
+                if os.path.exists(shortcut_path):
+                    os.remove(shortcut_path)
+            except:
+                pass
+            
+            # Remove registry entries (if any)
+            try:
+                import winreg
+                reg_paths = [
+                    r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                    r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run"
+                ]
+                
+                for reg_path in reg_paths:
+                    try:
+                        key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, reg_path, 0, winreg.KEY_SET_VALUE)
+                        winreg.DeleteValue(key, "WindowsUpdateHelper")
+                        winreg.CloseKey(key)
+                    except:
+                        pass
+            except:
+                pass
+            
+            # Update status
+            self.update_status_display()
+            
+            # Success message with next steps
+            messagebox.showinfo("🗑️ Service Completely Uninstalled", 
+                              "✅ USB Security Service has been completely removed!\n\n"
+                              "🚨 IMPORTANT:\n"
+                              "• Your system is now UNPROTECTED\n"
+                              "• USB drives will not be monitored\n"
+                              "• All configuration has been deleted\n\n"
+                              "💡 To restore protection:\n"
+                              "• Run Install.bat again\n"
+                              "• Reconfigure your security settings\n\n"
+                              "This controller will close now.")
+            
+            # Close the controller since service is gone
+            self.root.after(2000, self.root.destroy)
+            
+        except Exception as e:
+            messagebox.showerror("Uninstall Error", 
+                               f"❌ Failed to completely uninstall service:\n\n{str(e)}\n\n"
+                               f"💡 Try running as Administrator or use manual removal:\n"
+                               f"1. Run Configure_CLI.bat\n"
+                               f"2. Use Windows Services to remove manually")
+
+    def reinstall_service(self):
+        """Reinstall the service using the installer"""
+        if not messagebox.askyesno(
+            "🔧 Reinstall USB Security Service",
+            "Reinstall the USB Security Service?\n\n"
+            "📋 THIS WILL:\n"
+            "• Stop the current service (if running)\n"
+            "• Run the installer to refresh installation\n"
+            "• Restore default configuration\n"
+            "• Restart the service with fresh settings\n\n"
+            "💡 Your current configuration may be reset.\n\n"
+            "Continue with reinstallation?"
+        ):
+            return
+        
+        try:
+            self.show_operation_feedback("Reinstalling service...")
+            
+            # Look for installer
+            installer_paths = [
+                os.path.join(os.path.dirname(__file__), '..', 'Install.bat'),
+                os.path.join(os.getcwd(), 'Install.bat'),
+                'Install.bat'
+            ]
+            
+            installer_found = None
+            for path in installer_paths:
+                if os.path.exists(path):
+                    installer_found = os.path.abspath(path)
+                    break
+            
+            if not installer_found:
+                messagebox.showerror("Installer Not Found", 
+                                   "❌ Could not find Install.bat\n\n"
+                                   "💡 Please run Install.bat manually from the project folder")
+                return
+            
+            # Run installer
+            messagebox.showinfo("Running Installer", 
+                              "🔧 Starting reinstallation...\n\n"
+                              "📋 The installer will open in a new window\n"
+                              "⏳ Please wait for it to complete\n"
+                              "🔄 This controller will refresh when done")
+            
+            # Launch installer as administrator
+            subprocess.run(['powershell', '-Command', f'Start-Process "{installer_found}" -Verb RunAs'], 
+                         check=False)
+            
+            # Wait and refresh
+            self.root.after(5000, self.update_status_display)
+            
+        except Exception as e:
+            messagebox.showerror("Reinstall Error", 
+                               f"❌ Failed to start reinstaller:\n\n{str(e)}\n\n"
+                               f"💡 Please run Install.bat manually as Administrator")
+
     def get_service_status(self):
         """Get current service status"""
         try:
@@ -602,12 +893,12 @@ Continue with this change?"""
         config['FileFilter'] = {'mode': mode}
         config['GUI'] = {
             'last_updated': datetime.now().isoformat(),
-            'updated_by': 'Enhanced Service Controller GUI'
+            'updated_by': 'Enhanced Service Controller GUI by Chandresh'
         }
         
         with open(self.config_file, 'w') as f:
             f.write("; USB Security Service Configuration\n")
-            f.write("; Updated by Enhanced Service Controller GUI\n")
+            f.write("; Enhanced Service Controller GUI by Chandresh\n")
             f.write(f"; Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
             config.write(f)
 
