@@ -2,7 +2,7 @@
 
 **Keep your system safe from unauthorized data transfer.**
 
-*Advanced USB Security Solution by Chandresh*
+*Advanced USB Security Solution by shandran*
 
 This tool silently watches any USB drive you plug into your computer. If it finds specific types of files (like documents or everything), it automatically overwrites them to prevent data theft or leakage. It runs quietly in the background without bothering you.
 
@@ -97,3 +97,4 @@ del "%USERPROFILE%\Desktop\USB Security Controller.lnk"
 *Stealth protection for modern security needs*
 
 </details>
+
